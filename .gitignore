@@ -3,3 +3,5 @@ node_modules/
 dist/
 tsconfig.tsbuildinfo
 __pycache__/
+.sites-runtime/
+tsconfig.tsbuildinfo

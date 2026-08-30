@@ -3,6 +3,12 @@ from uuid import uuid4
 
 from .models import ColumnMapping, PipelineProposal, PipelineProposalPatch, PipelineProposalRequest, ProposalValidation, SourceAssessment
 
+COMPILABLE_RUNTIMES = frozenset({"nifi"})
+RUNTIME_ADAPTER_NOTE = (
+    "The {runtime} execution adapter is not available yet, so approval records the decision "
+    "without generating a flow specification."
+)
+
 
 class PipelineProposalEngine:
     """Turns a natural-language requirement into a deterministic, reviewable draft."""
@@ -53,11 +59,12 @@ class PipelineProposalEngine:
         return match.group(1) if match else "public.customers"
 
     def revise(self, proposal: PipelineProposal, patch: PipelineProposalPatch, version: int) -> PipelineProposal:
-        updates = patch.model_dump(exclude_none=True)
+        updates = {field: getattr(patch, field) for field in patch.model_fields_set}
+        changed = {field: value for field, value in updates.items() if getattr(proposal, field) != value}
         updates.update({"proposal_id": str(uuid4()), "version": version, "status": "draft",
                         "parent_proposal_id": proposal.proposal_id, "execution_allowed": False})
         revised = proposal.model_copy(update=updates)
-        revised.confidence = max(50, proposal.confidence - (2 if updates else 0))
+        revised.confidence = max(50, proposal.confidence - (2 if changed else 0))
         revised.explanation = f"Version {version} applies reviewed visual-editor changes to version {proposal.version}. It remains non-executable until revalidated and approved."
         return revised
 
@@ -71,6 +78,8 @@ class PipelineProposalEngine:
             blockers.append("Incremental load requires a watermark column")
         if proposal.load_strategy == "cdc" and proposal.runtime != "kafka_debezium":
             blockers.append("CDC proposals require Kafka + Debezium runtime")
+        if proposal.runtime not in COMPILABLE_RUNTIMES:
+            warnings.append(RUNTIME_ADAPTER_NOTE.format(runtime=proposal.runtime))
         if not proposal.quality_gates:
             warnings.append("No quality gate protects the target")
         if not proposal.business_key:

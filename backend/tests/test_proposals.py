@@ -52,3 +52,26 @@ def test_validation_blocks_incremental_without_watermark():
     validation = engine.validate(revised)
     assert validation.valid is False
     assert any("watermark" in blocker.lower() for blocker in validation.blockers)
+
+def test_revision_can_clear_an_optional_field_explicitly():
+    engine = PipelineProposalEngine()
+    original = engine.compile(PipelineProposalRequest(requirement="Ingest customers incrementally every hour."), assessment(), 1)
+    revised = engine.revise(original, PipelineProposalPatch(watermark_column=None), 2)
+    assert original.watermark_column == "updated_at"
+    assert revised.watermark_column is None
+    assert engine.validate(revised).valid is False
+
+
+def test_empty_revision_keeps_confidence_unchanged():
+    engine = PipelineProposalEngine()
+    original = engine.compile(PipelineProposalRequest(requirement="Ingest customers incrementally every hour."), assessment(), 1)
+    revised = engine.revise(original, PipelineProposalPatch(), 2)
+    assert revised.confidence == original.confidence
+
+
+def test_missing_execution_adapter_is_surfaced_as_a_warning():
+    engine = PipelineProposalEngine()
+    proposal = engine.compile(PipelineProposalRequest(requirement="Ingest public.transactions in real-time with CDC."), None, 1)
+    validation = engine.validate(proposal)
+    assert validation.valid is True
+    assert any("kafka_debezium" in warning for warning in validation.warnings)
