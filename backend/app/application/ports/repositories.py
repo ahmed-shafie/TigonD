@@ -1,0 +1,19 @@
+from typing import Protocol
+
+from ...models import AssistantRequest, AssistantResponse, PipelineProposal, SourceAssessment
+
+
+class AssessmentReader(Protocol):
+    def get_assessment(self, assessment_id: str) -> SourceAssessment: ...
+
+
+class ProposalRepository(Protocol):
+    def next_proposal_version(self) -> int: ...
+    def get_pipeline_proposal(self, proposal_id: str) -> PipelineProposal: ...
+    def save_pipeline_proposal(self, proposal: PipelineProposal, assessment_id: str | None, actor: str) -> PipelineProposal: ...
+
+
+class AssistantRepository(Protocol):
+    def assistant_context(self, assessment_id: str | None = None, deployment_id: str | None = None) -> dict: ...
+    def save_assistant_exchange(self, request: AssistantRequest, response: AssistantResponse, actor: str) -> AssistantResponse: ...
+

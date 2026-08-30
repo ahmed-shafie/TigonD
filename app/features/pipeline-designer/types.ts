@@ -1,0 +1,3 @@
+export type PipelineProposal = {proposal_id:string;version:number;status:"draft"|"approved"|"rejected";runtime:string;source_object:string;target_pattern:string;load_strategy:string;schedule:string;business_key:string|null;watermark_column:string|null;mappings:{source:string;target:string;transformation:string}[];quality_gates:string[];transformations:string[];assumptions:string[];risks:string[];confidence:number;explanation:string;execution_allowed:false;parent_proposal_id?:string|null};
+export type ProposalValidation = {proposal_id:string;valid:boolean;score:number;blockers:string[];warnings:string[];changes_from_previous:string[]};
+

@@ -6,25 +6,20 @@ from psycopg import Error as PostgresError
 from .auth import Principal, current_principal, require_roles
 from .assistant import AssistantEngine
 from .config import get_settings
-from .intelligence import IntelligenceEngine
+from .dependencies import (assistant, get_assistant, get_nifi, get_postgres,
+                           get_repository, intelligence, nifi_client,
+                           nifi_compiler, postgres, proposal_engine, repository,
+                           settings)
 from .models import (AssistantRequest, AssistantResponse, AssessmentRequest, AuditEvent, ConnectionTestResult, DataObject, FlowDeployment, NiFiStatus, PipelineProposal, PipelineProposalPatch, PipelineProposalRequest, ProposalApprovalResult, ProposalDecision, ProposalValidation,
                      PostgresConnection, RecommendationDecision, RegisteredSource, SourceAssessment, TableProfile)
-from .nifi import NiFiClient, NiFiError, NiFiFlowCompiler
-from .proposals import PipelineProposalEngine
+from .nifi import NiFiClient, NiFiError
 from .postgres import PostgresService
+from .presentation.api.routers.skills import router as skills_router
+from .presentation.api.routers.assistant import router as assistant_router
+from .presentation.api.routers.operations import router as operations_router
+from .presentation.api.routers.intelligence import router as intelligence_router
+from .presentation.api.routers.platform import router as platform_router
 from .repository import SourceRepository
-from .vault import VaultSecretStore
-
-
-settings = get_settings()
-secret_store = VaultSecretStore(settings.vault_url, settings.vault_token, settings.vault_mount)
-repository = SourceRepository(settings.metadata_database_url, secret_store)
-postgres = PostgresService(settings.query_timeout_seconds, settings.profile_sample_rows)
-intelligence = IntelligenceEngine()
-nifi_compiler = NiFiFlowCompiler()
-nifi_client = NiFiClient(settings.nifi_url, settings.nifi_username, settings.nifi_password, settings.nifi_verify_ssl)
-assistant = AssistantEngine(settings.ollama_url, settings.ollama_model, settings.ollama_enabled)
-proposal_engine = PipelineProposalEngine()
 
 app = FastAPI(title="TigonD Ingestion API", version="0.3.0")
 app.add_middleware(
@@ -34,22 +29,11 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
-
-
-def get_repository() -> SourceRepository:
-    return repository
-
-
-def get_postgres() -> PostgresService:
-    return postgres
-
-
-def get_nifi() -> NiFiClient:
-    return nifi_client
-
-
-def get_assistant() -> AssistantEngine:
-    return assistant
+app.include_router(skills_router)
+app.include_router(assistant_router)
+app.include_router(operations_router)
+app.include_router(intelligence_router)
+app.include_router(platform_router)
 
 
 @app.get("/health")
@@ -255,18 +239,6 @@ def nifi_flow_status(
 @app.get("/api/v1/audit", response_model=list[AuditEvent])
 def audit_events(repo: SourceRepository = Depends(get_repository), _: Principal = Depends(require_roles("administrator", "governance"))):
     return repo.list_audit()
-
-
-@app.post("/api/v1/assistant/chat", response_model=AssistantResponse)
-def assistant_chat(
-    request: AssistantRequest,
-    repo: SourceRepository = Depends(get_repository),
-    engine: AssistantEngine = Depends(get_assistant),
-    principal: Principal = Depends(require_roles("administrator", "developer", "operator", "quality", "governance")),
-):
-    context = repo.assistant_context(request.assessment_id, request.deployment_id)
-    response = engine.answer(request, context)
-    return repo.save_assistant_exchange(request, response, principal.username)
 
 
 @app.post("/api/v1/pipeline-proposals", response_model=PipelineProposal, status_code=status.HTTP_201_CREATED)

@@ -145,6 +145,40 @@ def test_health():
     assert TestClient(app).get("/health").json()["status"] == "healthy"
 
 
+def test_skill_catalog_preserves_role_and_approval_boundaries():
+    response = TestClient(app).get("/api/v1/skills")
+    assert response.status_code == 200
+    skills = {item["key"]: item for item in response.json()}
+    assert skills["source-profile"]["implemented"] is True
+    assert skills["nifi-deploy"]["requires_approval"] is True
+    assert "incident-diagnosis" not in skills
+
+
+def test_public_api_contract_contains_all_phase_32_routes():
+    paths = TestClient(app).get("/openapi.json").json()["paths"]
+    expected = {
+        "/api/v1/sources/test",
+        "/api/v1/sources/{source_id}/objects",
+        "/api/v1/sources/{source_id}/assess/{schema_name}/{table_name}",
+        "/api/v1/assistant/chat",
+        "/api/v1/pipeline-proposals",
+        "/api/v1/pipeline-proposals/{proposal_id}/validate",
+        "/api/v1/pipeline-proposals/{proposal_id}/decision",
+        "/api/v1/skills",
+        "/api/v1/operational-actions",
+        "/api/v1/operational-actions/{action_id}/decision",
+        "/api/v1/operational-actions/{action_id}/execute",
+        "/api/v1/intelligence/diagnoses",
+        "/api/v1/intelligence/memory/search",
+        "/api/v1/intelligence/insights",
+        "/api/v1/platform/connectors",
+        "/api/v1/platform/runtimes",
+        "/api/v1/platform/lineage",
+        "/api/v1/platform/workspaces",
+    }
+    assert expected.issubset(paths)
+
+
 def test_connection_contract():
     response = TestClient(app).post("/api/v1/sources/test", json=payload())
     assert response.status_code == 200
