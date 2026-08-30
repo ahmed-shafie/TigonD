@@ -1,0 +1,112 @@
+services:
+  frontend:
+    build:
+      context: ..
+      dockerfile: Dockerfile.onprem
+      args:
+        NEXT_PUBLIC_TIGOND_API_URL: http://localhost:8000
+        NEXT_PUBLIC_KEYCLOAK_URL: http://localhost:8080
+    ports: ["3000:3000"]
+    depends_on: [api, keycloak]
+
+  api:
+    build: .
+    environment:
+      TIGOND_METADATA_DATABASE_URL: postgresql://tigond_meta:tigond_meta@metadata-db:5432/tigond_metadata
+      TIGOND_VAULT_URL: http://vault:8200
+      TIGOND_VAULT_TOKEN: tigond-dev-root
+      TIGOND_VAULT_MOUNT: tigond
+      TIGOND_KEYCLOAK_URL: http://keycloak:8080
+      TIGOND_KEYCLOAK_REALM: tigond
+      TIGOND_KEYCLOAK_CLIENT_ID: tigond-ui
+      TIGOND_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:4173
+      TIGOND_NIFI_URL: http://nifi:8080/nifi-api
+      TIGOND_NIFI_VERIFY_SSL: "false"
+      TIGOND_OLLAMA_URL: http://ollama:11434
+      TIGOND_OLLAMA_MODEL: qwen2.5:3b
+      TIGOND_OLLAMA_ENABLED: "false"
+    ports: ["8000:8000"]
+    depends_on:
+      metadata-db: {condition: service_healthy}
+      vault: {condition: service_healthy}
+      keycloak: {condition: service_started}
+      nifi: {condition: service_started}
+      ollama: {condition: service_started}
+
+  metadata-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: tigond_metadata
+      POSTGRES_USER: tigond_meta
+      POSTGRES_PASSWORD: tigond_meta
+    ports: ["55432:5432"]
+    volumes: ["metadata-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tigond_meta -d tigond_metadata"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  source-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: customer_360
+      POSTGRES_USER: tigond_reader
+      POSTGRES_PASSWORD: demo-password
+    ports: ["5432:5432"]
+    volumes: ["./bootstrap/source.sql:/docker-entrypoint-initdb.d/source.sql:ro"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tigond_reader -d customer_360"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  vault:
+    image: hashicorp/vault:1.19
+    cap_add: ["IPC_LOCK"]
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: tigond-dev-root
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    ports: ["8200:8200"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8200/v1/sys/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3
+    command: start-dev --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    ports: ["8080:8080"]
+    volumes: ["./keycloak/tigond-realm.json:/opt/keycloak/data/import/tigond-realm.json:ro"]
+
+  nifi:
+    image: apache/nifi:2.4.0
+    environment:
+      NIFI_WEB_HTTP_HOST: 0.0.0.0
+      NIFI_WEB_HTTP_PORT: 8080
+      NIFI_SENSITIVE_PROPS_KEY: tigond-development-sensitive-key
+    ports: ["18080:8080"]
+    volumes:
+      - nifi-database:/opt/nifi/nifi-current/database_repository
+      - nifi-flowfile:/opt/nifi/nifi-current/flowfile_repository
+      - nifi-content:/opt/nifi/nifi-current/content_repository
+      - nifi-provenance:/opt/nifi/nifi-current/provenance_repository
+      - nifi-data:/data
+
+  ollama:
+    image: ollama/ollama:0.11.4
+    ports: ["11434:11434"]
+    volumes: ["ollama-data:/root/.ollama"]
+
+volumes:
+  metadata-data:
+  nifi-database:
+  nifi-flowfile:
+  nifi-content:
+  nifi-provenance:
+  nifi-data:
+  ollama-data:
