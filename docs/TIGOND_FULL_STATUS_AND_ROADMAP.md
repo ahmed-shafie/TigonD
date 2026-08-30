@@ -1,7 +1,7 @@
 # TigonD — Full Implementation Status and Roadmap
 
 **Current release:** Functional MVP code-complete  
-**Functional MVP completion:** approximately 90% (external runtime validation remains)  
+**Functional MVP completion:** approximately 85% (Airbyte, dlt and Debezium adapters and external runtime validation remain)  
 **Production-ready platform completion:** approximately 50%  
 **Current application:** <https://tigond-ingestion.ahmedshafie.chatgpt.site>
 
@@ -105,7 +105,7 @@
 | Immutable proposal versions | ✅ | Every saved edit creates a child version |
 | Version comparison | ✅ | Field, mapping and rule differences |
 | Validation score, blockers and warnings | ✅ | Unsafe proposals cannot be approved |
-| Incremental and CDC validation | ✅ | Enforces watermark and runtime constraints |
+| Incremental and CDC validation | ⚠️ | Enforced; CDC proposals are approvable but produce no flow until a Debezium adapter exists |
 | Human approval | ✅ | Administrator/developer permission required |
 | Approved proposal to NiFi compilation | ✅ | Produces a generated flow specification |
 | Automatic deployment after approval | 🔒 | Disabled; deployment remains separate |
@@ -179,7 +179,7 @@ The standard interface already supports NiFi deployment, start and stop. Phase 3
 | Capability | Status |
 |---|---:|
 | Long-term platform memory | ✅ |
-| Semantic metadata search | ⚠️ |
+| Semantic metadata search | ❌ |
 | User-preference memory | ✅ |
 | Proactive quality alerts | ✅ |
 | Pipeline-risk prediction | ✅ |
@@ -198,7 +198,7 @@ The standard interface already supports NiFi deployment, start and stop. Phase 3
 | Data Governance workspace | ✅ | Lineage and classification workspace |
 | Data Quality workspace | ✅ | Evidence, rules and quarantine workspace |
 | Operations workspace | ✅ | Runtime, incidents and approved actions workspace |
-| Administrator workspace | ✅ | Connector, runtime and skill inventory API |
+| Administrator workspace | ⚠️ | Connector, runtime and skill inventory API; catalog counts are static |
 | DataOps and DevOps workspaces | ❌ | Not implemented |
 | Fine-grained UI permissions | ⚠️ | API roles exist; UI needs expansion |
 | Prometheus, Grafana and OpenTelemetry | ❌ | Not implemented |
@@ -218,8 +218,9 @@ The standard interface already supports NiFi deployment, start and stop. Phase 3
 
 ## Current Verification Baseline
 
-- 19 backend tests passing
-- 5 frontend tests passing
-- Production frontend build passing
+- 56 backend tests passing, including real Keycloak token validation and PostgreSQL persistence tests
+- Root and worker TypeScript type checks passing
+- ESLint and the production frontend build passing
+- Alembic `upgrade head` and `downgrade base` verified against PostgreSQL 16
 - Docker Compose configuration validated
 - Phase 3.2 deployed successfully

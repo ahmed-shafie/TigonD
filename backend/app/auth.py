@@ -29,9 +29,11 @@ def current_principal(credentials: HTTPAuthorizationCredentials | None = Securit
     issuer = f"{settings.keycloak_url}/realms/{settings.keycloak_realm}"
     try:
         signing_key = jwks_client(f"{issuer}/protocol/openid-connect/certs").get_signing_key_from_jwt(credentials.credentials)
-        claims = jwt.decode(credentials.credentials, signing_key.key, algorithms=["RS256"], audience=settings.keycloak_client_id, issuer=issuer)
+        claims = jwt.decode(credentials.credentials, signing_key.key, algorithms=["RS256"], audience=settings.audience, issuer=issuer)
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access token") from exc
+    if claims.get("azp", settings.keycloak_client_id) != settings.keycloak_client_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Access token was issued to another client")
     return Principal(claims.get("preferred_username", claims.get("sub", "unknown")), frozenset(claims.get("realm_access", {}).get("roles", [])))
 
 

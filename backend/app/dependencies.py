@@ -5,6 +5,8 @@ from .application.use_cases.operational_actions import OperationalActionService
 from .application.use_cases.intelligence_loop import IntelligenceLoop
 from .application.use_cases.platform_catalog import PlatformCatalog
 from .config import get_settings
+from .infrastructure.action_store import PostgresOperationalActionStore
+from .infrastructure.intelligence_store import PostgresIntelligenceStore
 from .infrastructure.skills import BuiltinSkillRegistry
 from .intelligence import IntelligenceEngine
 from .nifi import NiFiClient, NiFiFlowCompiler
@@ -24,8 +26,8 @@ nifi_client = NiFiClient(settings.nifi_url, settings.nifi_username, settings.nif
 assistant = AssistantEngine(settings.ollama_url, settings.ollama_model, settings.ollama_enabled)
 proposal_engine = PipelineProposalEngine()
 skill_browser = BrowseSkills(BuiltinSkillRegistry())
-operational_actions = OperationalActionService()
-intelligence_loop = IntelligenceLoop()
+operational_actions = OperationalActionService(PostgresOperationalActionStore(settings.metadata_database_url))
+intelligence_loop = IntelligenceLoop(PostgresIntelligenceStore(settings.metadata_database_url))
 platform_catalog = PlatformCatalog()
 
 

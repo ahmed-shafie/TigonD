@@ -35,6 +35,8 @@ yarn-error.log*
 
 # typescript
 next-env.d.ts
+tsconfig.tsbuildinfo
+/.vite/
 /dist/
 /.wrangler/
 /.sites-runtime/

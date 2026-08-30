@@ -1,20 +1,17 @@
 from datetime import datetime, timezone
-from threading import Lock
 from uuid import uuid4
 
 from ...models import (IncidentDiagnosis, IncidentSignal, IntelligenceMetrics,
                        MemoryRecord, MemoryRecordRequest, ProactiveInsight,
                        RecommendationFeedback)
+from ..ports.repositories import IntelligenceStore
 
 
 class IntelligenceLoop:
-    """CPU-first diagnosis, memory and feedback loop grounded in platform evidence."""
+    """CPU-first diagnosis, memory and feedback loop grounded in persisted evidence."""
 
-    def __init__(self):
-        self._incidents: dict[str, IncidentDiagnosis] = {}
-        self._memory: list[MemoryRecord] = []
-        self._feedback: list[RecommendationFeedback] = []
-        self._lock = Lock()
+    def __init__(self, store: IntelligenceStore):
+        self.store = store
 
     def diagnose(self, signal: IncidentSignal) -> IncidentDiagnosis:
         text = signal.message.lower()
@@ -33,36 +30,33 @@ class IntelligenceLoop:
         severity = "critical" if signal.invalid_processors > 2 or signal.queued_count > 50_000 else "high" if category in {"schema_drift", "data_quality", "backpressure"} else "medium"
         evidence = [signal.message, f"queued_count={signal.queued_count}", f"invalid_processors={signal.invalid_processors}"]
         diagnosis = IncidentDiagnosis(incident_id=str(uuid4()), deployment_id=signal.deployment_id, category=category, severity=severity, confidence=90 if category != "unknown" else 45, root_cause=cause, evidence=evidence, remediation_steps=steps, rollback_recommended=category in {"schema_drift", "data_quality"}, created_at=datetime.now(timezone.utc).isoformat())
-        with self._lock:
-            self._incidents[diagnosis.incident_id] = diagnosis
+        self.store.add_incident(diagnosis)
         return diagnosis
 
     def timeline(self, deployment_id: str) -> list[IncidentDiagnosis]:
-        return [item for item in self._incidents.values() if item.deployment_id == deployment_id]
+        return self.store.incidents_for_deployment(deployment_id)
 
     def remember(self, request: MemoryRecordRequest) -> MemoryRecord:
         record = MemoryRecord(**request.model_dump(), memory_id=str(uuid4()), created_at=datetime.now(timezone.utc).isoformat())
-        with self._lock:
-            self._memory.append(record)
-            self._memory = self._memory[-2000:]
+        self.store.add_memory(record)
         return record
 
     def recall(self, query: str, scope: str | None = None) -> list[MemoryRecord]:
-        terms = {term for term in query.lower().split() if len(term) > 2}
-        scored = [(sum(term in f"{m.subject_id} {m.fact} {m.source}".lower() for term in terms), m) for m in self._memory if not scope or m.scope == scope]
+        terms = sorted({term for term in query.lower().split() if len(term) > 2})
+        candidates = self.store.search_memory(terms, scope)
+        scored = [(sum(term in f"{m.subject_id} {m.fact} {m.source}".lower() for term in terms), m) for m in candidates]
         return [item for score, item in sorted(scored, key=lambda pair: pair[0], reverse=True) if score][:20]
 
     def feedback(self, item: RecommendationFeedback) -> IntelligenceMetrics:
-        with self._lock:
-            self._feedback.append(item)
+        self.store.add_feedback(item)
         return self.metrics()
 
     def metrics(self) -> IntelligenceMetrics:
-        total = len(self._feedback)
-        return IntelligenceMetrics(total_feedback=total, acceptance_rate=round(100 * sum(x.accepted for x in self._feedback) / total, 2) if total else 0, successful_outcome_rate=round(100 * sum(x.outcome == "successful" for x in self._feedback) / total, 2) if total else 0)
+        total, accepted, successful = self.store.feedback_totals()
+        return IntelligenceMetrics(total_feedback=total, acceptance_rate=round(100 * accepted / total, 2) if total else 0, successful_outcome_rate=round(100 * successful / total, 2) if total else 0)
 
     def insights(self) -> list[ProactiveInsight]:
-        open_incidents = [item for item in self._incidents.values() if item.status == "open"]
+        open_incidents = self.store.open_incidents()
         if not open_incidents:
             return []
         critical = [item for item in open_incidents if item.severity in {"critical", "high"}]

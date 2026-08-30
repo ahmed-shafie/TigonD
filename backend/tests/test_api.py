@@ -78,10 +78,8 @@ class FakeRepository:
         self.last_assistant_actor = actor
         return response.model_copy(update={"conversation_id": request.conversation_id or "conversation-1"})
 
-    def next_proposal_version(self):
-        return len(self.proposals) + 1
-
-    def save_pipeline_proposal(self, proposal, assessment_id, actor):
+    def save_pipeline_proposal(self, build, assessment_id, actor):
+        proposal = build(len(self.proposals) + 1)
         self.proposal = proposal
         self.proposal_assessment_id = assessment_id
         self.proposals[proposal.proposal_id] = proposal
@@ -93,10 +91,11 @@ class FakeRepository:
     def get_proposal_assessment_id(self, _proposal_id):
         return self.proposal_assessment_id
 
-    def save_proposal_revision(self, proposal, assessment_id, actor):
-        return self.save_pipeline_proposal(proposal, assessment_id, actor)
+    def save_proposal_revision(self, build, assessment_id, actor):
+        return self.save_pipeline_proposal(build, assessment_id, actor)
 
     def decide_pipeline_proposal(self, proposal_id, decision, reason, actor):
+        self.proposal_decision = (proposal_id, decision, reason, actor)
         self.proposal = self.proposals[proposal_id].model_copy(update={"status": decision})
         self.proposals[proposal_id] = self.proposal
         return self.proposal
@@ -290,6 +289,8 @@ def test_natural_language_requirement_creates_non_executable_proposal():
     assert fetched.status_code == 200
     assert fetched.json()["proposal_id"] == body["proposal_id"]
 
+    TestClient(app).post(f"/api/v1/assessments/{assessment_id}/decision", json={"decision": "approved"})
+
     revised = TestClient(app).put(f"/api/v1/pipeline-proposals/{body['proposal_id']}", json={
         "schedule":"0 */2 * * *", "quality_gates":["completeness >= 98%", "route invalid records to quarantine"]
     })
@@ -300,7 +301,83 @@ def test_natural_language_requirement_creates_non_executable_proposal():
     assert validation.json()["valid"] is True
     assert validation.json()["changes_from_previous"]
 
-    approved = TestClient(app).post(f"/api/v1/pipeline-proposals/{revised.json()['proposal_id']}/decision", json={"decision":"approved"})
+    approved = TestClient(app).post(f"/api/v1/pipeline-proposals/{revised.json()['proposal_id']}/decision",
+                                    json={"decision":"approved", "reason":"Reviewed with the data owner"})
     assert approved.status_code == 200
     assert approved.json()["proposal"]["status"] == "approved"
     assert approved.json()["deployment"]["status"] == "generated"
+    assert approved.json()["compiled"] is True
+    assert fake_repo.proposal_decision[2] == "Reviewed with the data owner"
+
+
+def test_proposal_cannot_compile_while_the_assessment_is_not_approved():
+    TestClient(app).post("/api/v1/sources", json=payload())
+    assessment_id = TestClient(app).post("/api/v1/sources/source-1/assess/public/customers", json={
+        "desired_latency":"daily", "transformation_complexity":"high",
+        "prefer_visual_design":True, "packaged_connector_available":True,
+    }).json()["assessment_id"]
+    TestClient(app).post(f"/api/v1/assessments/{assessment_id}/decision", json={"decision": "rejected", "reason": "Quality too low"})
+    proposal = TestClient(app).post("/api/v1/pipeline-proposals", json={
+        "requirement":"Ingest customers incrementally every hour and quarantine invalid records.",
+        "assessment_id": assessment_id,
+    }).json()
+
+    response = TestClient(app).post(f"/api/v1/pipeline-proposals/{proposal['proposal_id']}/decision", json={"decision":"approved"})
+    assert response.status_code == 409
+    assert "approved by a human" in response.json()["detail"]
+
+
+def test_cdc_proposal_is_approved_without_compilation_until_its_adapter_exists():
+    TestClient(app).post("/api/v1/sources", json=payload())
+    assessment_id = TestClient(app).post("/api/v1/sources/source-1/assess/public/customers", json={
+        "desired_latency":"daily", "transformation_complexity":"high",
+        "prefer_visual_design":True, "packaged_connector_available":True,
+    }).json()["assessment_id"]
+    TestClient(app).post(f"/api/v1/assessments/{assessment_id}/decision", json={"decision": "approved"})
+    proposal = TestClient(app).post("/api/v1/pipeline-proposals", json={
+        "requirement":"Ingest public.transactions in real-time with CDC into the bronze zone.",
+        "assessment_id": assessment_id,
+    }).json()
+    assert proposal["runtime"] == "kafka_debezium"
+
+    response = TestClient(app).post(f"/api/v1/pipeline-proposals/{proposal['proposal_id']}/decision", json={"decision":"approved"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["proposal"]["status"] == "approved"
+    assert body["compiled"] is False
+    assert body["deployment"] is None
+    assert "kafka_debezium" in body["compilation_note"]
+
+
+def test_standalone_cdc_proposal_is_approved_without_an_assessment():
+    proposal = TestClient(app).post("/api/v1/pipeline-proposals", json={
+        "requirement":"Ingest public.transactions in real-time with CDC into the bronze zone.",
+    }).json()
+    assert proposal["runtime"] == "kafka_debezium"
+
+    response = TestClient(app).post(f"/api/v1/pipeline-proposals/{proposal['proposal_id']}/decision", json={"decision":"approved"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["proposal"]["status"] == "approved"
+    assert body["compiled"] is False
+    assert "kafka_debezium" in body["compilation_note"]
+
+
+def test_revision_rejecting_a_cleared_required_field_returns_422():
+    proposal = TestClient(app).post("/api/v1/pipeline-proposals", json={
+        "requirement":"Ingest customers incrementally every hour and quarantine invalid records.",
+    }).json()
+
+    response = TestClient(app).put(f"/api/v1/pipeline-proposals/{proposal['proposal_id']}",
+                                   json={"target_pattern": None})
+    assert response.status_code == 422
+    assert "target_pattern" in response.json()["detail"]
+
+
+def test_browser_can_preflight_a_proposal_revision():
+    response = TestClient(app).options("/api/v1/pipeline-proposals/proposal-1", headers={
+        "Origin": "http://localhost:3000",
+        "Access-Control-Request-Method": "PUT",
+    })
+    assert response.status_code == 200
+    assert "PUT" in response.headers["access-control-allow-methods"]

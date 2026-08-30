@@ -13,6 +13,7 @@ from .dependencies import (assistant, get_assistant, get_nifi, get_postgres,
 from .models import (AssistantRequest, AssistantResponse, AssessmentRequest, AuditEvent, ConnectionTestResult, DataObject, FlowDeployment, NiFiStatus, PipelineProposal, PipelineProposalPatch, PipelineProposalRequest, ProposalApprovalResult, ProposalDecision, ProposalValidation,
                      PostgresConnection, RecommendationDecision, RegisteredSource, SourceAssessment, TableProfile)
 from .nifi import NiFiClient, NiFiError
+from .proposals import COMPILABLE_RUNTIMES, RUNTIME_ADAPTER_NOTE
 from .postgres import PostgresService
 from .presentation.api.routers.skills import router as skills_router
 from .presentation.api.routers.assistant import router as assistant_router
@@ -26,7 +27,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
     allow_headers=["*"],
 )
 app.include_router(skills_router)
@@ -249,8 +250,10 @@ def create_pipeline_proposal(
 ):
     try:
         assessment = repo.get_assessment(request.assessment_id) if request.assessment_id else None
-        proposal = proposal_engine.compile(request, assessment, repo.next_proposal_version())
-        return repo.save_pipeline_proposal(proposal, request.assessment_id, principal.username)
+        return repo.save_pipeline_proposal(
+            lambda version: proposal_engine.compile(request, assessment, version),
+            request.assessment_id, principal.username,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Assessment not found") from exc
 
@@ -276,10 +279,16 @@ def revise_pipeline_proposal(
 ):
     try:
         current = repo.get_pipeline_proposal(proposal_id)
-        revised = proposal_engine.revise(current, patch, repo.next_proposal_version())
-        return repo.save_proposal_revision(revised, repo.get_proposal_assessment_id(proposal_id), principal.username)
+        assessment_id = repo.get_proposal_assessment_id(proposal_id)
+        proposal_engine.check_patch(patch)
+        return repo.save_proposal_revision(
+            lambda version: proposal_engine.revise(current, patch, version),
+            assessment_id, principal.username,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Pipeline proposal not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/pipeline-proposals/{proposal_id}/validate", response_model=ProposalValidation)
@@ -313,24 +322,29 @@ def decide_pipeline_proposal(
             raise ValueError("Proposal has validation blockers")
         deployment = None
         spec = None
+        note = None
         if decision.decision == "approved":
-            assessment_id = repo.get_proposal_assessment_id(proposal_id)
-            if not assessment_id:
-                raise ValueError("An evidence-based source assessment is required before NiFi compilation")
-            if proposal.runtime != "nifi":
-                raise ValueError("Only NiFi proposals can compile until the selected runtime adapter is available")
-            assessment = repo.get_assessment(assessment_id)
-            draft = assessment.pipeline_draft.model_copy(update={
-                "load_strategy": proposal.load_strategy, "business_key": proposal.business_key,
-                "watermark_column": proposal.watermark_column, "target_pattern": proposal.target_pattern,
-                "quality_gates": proposal.quality_gates, "status": "approved",
-            })
-            compiled_assessment = assessment.model_copy(update={"pipeline_draft": draft, "recommended_runtime": proposal.runtime})
-            spec = nifi_compiler.compile(compiled_assessment, repo.next_flow_version(assessment_id))
+            if proposal.runtime in COMPILABLE_RUNTIMES:
+                assessment_id = repo.get_proposal_assessment_id(proposal_id)
+                if not assessment_id:
+                    raise ValueError("An evidence-based source assessment is required before NiFi compilation")
+                assessment = repo.get_assessment(assessment_id)
+                if assessment.pipeline_draft.status != "approved":
+                    raise ValueError("The source assessment must be approved by a human before compilation")
+                draft = assessment.pipeline_draft.model_copy(update={
+                    "load_strategy": proposal.load_strategy, "business_key": proposal.business_key,
+                    "watermark_column": proposal.watermark_column, "target_pattern": proposal.target_pattern,
+                    "quality_gates": proposal.quality_gates,
+                })
+                compiled_assessment = assessment.model_copy(update={"pipeline_draft": draft, "recommended_runtime": proposal.runtime})
+                spec = nifi_compiler.compile(compiled_assessment, repo.next_flow_version(assessment_id))
+            else:
+                note = RUNTIME_ADAPTER_NOTE.format(runtime=proposal.runtime)
         approved = repo.decide_pipeline_proposal(proposal_id, decision.decision, decision.reason, principal.username)
         if spec is not None:
             deployment = repo.save_generated_flow(assessment_id, spec, principal.username)
-        return ProposalApprovalResult(proposal=approved, validation=validation, deployment=deployment)
+        return ProposalApprovalResult(proposal=approved, validation=validation, deployment=deployment,
+                                      compiled=spec is not None, compilation_note=note)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Pipeline proposal not found") from exc
     except ValueError as exc:
