@@ -243,3 +243,5 @@ class ProposalApprovalResult(BaseModel):
     proposal: PipelineProposal
     validation: ProposalValidation
     deployment: FlowDeployment | None = None
+    compiled: bool = False
+    compilation_note: str | None = None

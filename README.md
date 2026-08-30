@@ -102,6 +102,7 @@ actions tied to the current ChatGPT user. Leave public content anonymous.
 - `npm run start`: start the built Vinext application
 - `npm test`: build and verify the rendered development-preview metadata
 - `npm run db:generate`: generate Drizzle migrations after schema changes
+- `npm run typecheck`: type-check the studio (`tsconfig.json`) and the Cloudflare worker, D1 client and examples (`tsconfig.worker.json`)
 
 Use build commands for targeted diagnosis after a remote failure, not as part of the normal checkpoint path.
 

@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 from uuid import uuid4
 
 import psycopg
@@ -6,6 +7,8 @@ from psycopg.rows import dict_row
 
 from .models import AssistantRequest, AssistantResponse, AuditEvent, FlowDeployment, NiFiFlowSpec, PipelineProposal, PostgresConnection, RegisteredSource, SourceAssessment
 from .vault import MemorySecretStore, VaultSecretStore
+
+PROPOSAL_VERSION_LOCK = 8_312_001
 
 
 class SourceRepository:
@@ -162,19 +165,25 @@ class SourceRepository:
             self._audit(cursor, actor, "assistant.read", "conversation", conversation_id, "success")
         return response.model_copy(update={"conversation_id": conversation_id})
 
-    def next_proposal_version(self) -> int:
+    def save_pipeline_proposal(self, build: Callable[[int], PipelineProposal], assessment_id: str | None, actor: str, action: str = "proposal.generated") -> PipelineProposal:
+        """Allocate the lineage version under lock, then build the proposal from it."""
         with self.connect() as db, db.cursor() as cursor:
-            cursor.execute("SELECT COALESCE(MAX(version),0)+1 AS version FROM pipeline_proposals")
-            return int(cursor.fetchone()["version"])
-
-    def save_pipeline_proposal(self, proposal: PipelineProposal, assessment_id: str | None, actor: str) -> PipelineProposal:
-        with self.connect() as db, db.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(%s, hashtext(%s))", (PROPOSAL_VERSION_LOCK, assessment_id or ""))
+            stored = build(self._next_proposal_version(cursor, assessment_id))
             cursor.execute("""INSERT INTO pipeline_proposals(id,assessment_id,version,status,requirement,spec,created_by)
                               VALUES (%s,%s,%s,'draft',%s,%s::jsonb,%s)""",
-                           (proposal.proposal_id, assessment_id, proposal.version, proposal.requirement,
-                            proposal.model_dump_json(), actor))
-            self._audit(cursor, actor, "proposal.generated", "pipeline_proposal", proposal.proposal_id, "success")
-        return proposal
+                           (stored.proposal_id, assessment_id, stored.version, stored.requirement,
+                            stored.model_dump_json(), actor))
+            self._audit(cursor, actor, action, "pipeline_proposal", stored.proposal_id, "success")
+        return stored
+
+    @staticmethod
+    def _next_proposal_version(cursor, assessment_id: str | None) -> int:
+        cursor.execute(
+            "SELECT COALESCE(MAX(version),0)+1 AS version FROM pipeline_proposals WHERE assessment_id IS NOT DISTINCT FROM %s",
+            (assessment_id,),
+        )
+        return int(cursor.fetchone()["version"])
 
     def get_pipeline_proposal(self, proposal_id: str) -> PipelineProposal:
         with self.connect() as db, db.cursor() as cursor:
@@ -194,12 +203,17 @@ class SourceRepository:
             raise KeyError(proposal_id)
         return row["assessment_id"]
 
-    def save_proposal_revision(self, proposal: PipelineProposal, assessment_id: str | None, actor: str) -> PipelineProposal:
-        return self.save_pipeline_proposal(proposal, assessment_id, actor)
+    def save_proposal_revision(self, build: Callable[[int], PipelineProposal], assessment_id: str | None, actor: str) -> PipelineProposal:
+        return self.save_pipeline_proposal(build, assessment_id, actor, "proposal.revised")
 
     def decide_pipeline_proposal(self, proposal_id: str, decision: str, reason: str | None, actor: str) -> PipelineProposal:
         with self.connect() as db, db.cursor() as cursor:
-            cursor.execute("UPDATE pipeline_proposals SET status=%s WHERE id=%s", (decision, proposal_id))
+            cursor.execute(
+                """UPDATE pipeline_proposals
+                   SET status=%s, decision_reason=%s, decided_by=%s, decided_at=CURRENT_TIMESTAMP
+                   WHERE id=%s""",
+                (decision, reason, actor, proposal_id),
+            )
             if cursor.rowcount == 0:
                 raise KeyError(proposal_id)
             self._audit(cursor, actor, f"proposal.{decision}", "pipeline_proposal", proposal_id, "success")

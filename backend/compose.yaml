@@ -19,6 +19,7 @@ services:
       TIGOND_KEYCLOAK_URL: http://keycloak:8080
       TIGOND_KEYCLOAK_REALM: tigond
       TIGOND_KEYCLOAK_CLIENT_ID: tigond-ui
+      TIGOND_KEYCLOAK_AUDIENCE: tigond-ui
       TIGOND_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:4173
       TIGOND_NIFI_URL: http://nifi:8080/nifi-api
       TIGOND_NIFI_VERIFY_SSL: "false"

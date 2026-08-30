@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     keycloak_url: str = "http://localhost:8080"
     keycloak_realm: str = "tigond"
     keycloak_client_id: str = "tigond-ui"
+    keycloak_audience: str = ""
     auth_disabled: bool = False
     nifi_url: str = "http://localhost:18080/nifi-api"
     nifi_username: str = ""
@@ -25,6 +26,10 @@ class Settings(BaseSettings):
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5:3b"
     ollama_enabled: bool = False
+
+    @property
+    def audience(self) -> str:
+        return self.keycloak_audience or self.keycloak_client_id
 
     @property
     def origins(self) -> list[str]:

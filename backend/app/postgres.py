@@ -26,7 +26,10 @@ class PostgresService:
             row_factory=dict_row,
         ) as connection:
             with connection.cursor() as cursor:
-                cursor.execute("SET statement_timeout = %s", (self.timeout_seconds * 1000,))
+                cursor.execute(
+                    "SELECT set_config('statement_timeout', %s, false)",
+                    (str(self.timeout_seconds * 1000),),
+                )
             yield connection
 
     def test(self, config: PostgresConnection) -> ConnectionTestResult:
