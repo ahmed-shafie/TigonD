@@ -1,3 +1,5 @@
+import pytest
+
 from app.models import PipelineDraft, PipelineProposalPatch, PipelineProposalRequest, SourceAssessment
 from app.proposals import PipelineProposalEngine
 
@@ -67,6 +69,13 @@ def test_empty_revision_keeps_confidence_unchanged():
     original = engine.compile(PipelineProposalRequest(requirement="Ingest customers incrementally every hour."), assessment(), 1)
     revised = engine.revise(original, PipelineProposalPatch(), 2)
     assert revised.confidence == original.confidence
+
+
+def test_revision_rejects_clearing_a_required_field():
+    engine = PipelineProposalEngine()
+    original = engine.compile(PipelineProposalRequest(requirement="Ingest customers incrementally every hour."), assessment(), 1)
+    with pytest.raises(ValueError, match="cannot be cleared: mappings, quality_gates"):
+        engine.revise(original, PipelineProposalPatch(mappings=None, quality_gates=None), 2)
 
 
 def test_missing_execution_adapter_is_surfaced_as_a_warning():

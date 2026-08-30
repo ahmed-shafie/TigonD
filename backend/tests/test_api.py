@@ -78,10 +78,8 @@ class FakeRepository:
         self.last_assistant_actor = actor
         return response.model_copy(update={"conversation_id": request.conversation_id or "conversation-1"})
 
-    def next_proposal_version(self, _assessment_id=None):
-        return len(self.proposals) + 1
-
-    def save_pipeline_proposal(self, proposal, assessment_id, actor):
+    def save_pipeline_proposal(self, build, assessment_id, actor):
+        proposal = build(len(self.proposals) + 1)
         self.proposal = proposal
         self.proposal_assessment_id = assessment_id
         self.proposals[proposal.proposal_id] = proposal
@@ -93,8 +91,8 @@ class FakeRepository:
     def get_proposal_assessment_id(self, _proposal_id):
         return self.proposal_assessment_id
 
-    def save_proposal_revision(self, proposal, assessment_id, actor):
-        return self.save_pipeline_proposal(proposal, assessment_id, actor)
+    def save_proposal_revision(self, build, assessment_id, actor):
+        return self.save_pipeline_proposal(build, assessment_id, actor)
 
     def decide_pipeline_proposal(self, proposal_id, decision, reason, actor):
         self.proposal_decision = (proposal_id, decision, reason, actor)
@@ -329,6 +327,17 @@ def test_standalone_cdc_proposal_is_approved_without_an_assessment():
     assert body["proposal"]["status"] == "approved"
     assert body["compiled"] is False
     assert "kafka_debezium" in body["compilation_note"]
+
+
+def test_revision_rejecting_a_cleared_required_field_returns_422():
+    proposal = TestClient(app).post("/api/v1/pipeline-proposals", json={
+        "requirement":"Ingest customers incrementally every hour and quarantine invalid records.",
+    }).json()
+
+    response = TestClient(app).put(f"/api/v1/pipeline-proposals/{proposal['proposal_id']}",
+                                   json={"target_pattern": None})
+    assert response.status_code == 422
+    assert "target_pattern" in response.json()["detail"]
 
 
 def test_browser_can_preflight_a_proposal_revision():

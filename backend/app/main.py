@@ -277,8 +277,10 @@ def create_pipeline_proposal(
 ):
     try:
         assessment = repo.get_assessment(request.assessment_id) if request.assessment_id else None
-        proposal = proposal_engine.compile(request, assessment, repo.next_proposal_version(request.assessment_id))
-        return repo.save_pipeline_proposal(proposal, request.assessment_id, principal.username)
+        return repo.save_pipeline_proposal(
+            lambda version: proposal_engine.compile(request, assessment, version),
+            request.assessment_id, principal.username,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Assessment not found") from exc
 
@@ -305,10 +307,15 @@ def revise_pipeline_proposal(
     try:
         current = repo.get_pipeline_proposal(proposal_id)
         assessment_id = repo.get_proposal_assessment_id(proposal_id)
-        revised = proposal_engine.revise(current, patch, repo.next_proposal_version(assessment_id))
-        return repo.save_proposal_revision(revised, assessment_id, principal.username)
+        proposal_engine.check_patch(patch)
+        return repo.save_proposal_revision(
+            lambda version: proposal_engine.revise(current, patch, version),
+            assessment_id, principal.username,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Pipeline proposal not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/pipeline-proposals/{proposal_id}/validate", response_model=ProposalValidation)

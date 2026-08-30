@@ -4,6 +4,7 @@ from uuid import uuid4
 from .models import ColumnMapping, PipelineProposal, PipelineProposalPatch, PipelineProposalRequest, ProposalValidation, SourceAssessment
 
 COMPILABLE_RUNTIMES = frozenset({"nifi"})
+CLEARABLE_FIELDS = frozenset({"business_key", "watermark_column"})
 RUNTIME_ADAPTER_NOTE = (
     "The {runtime} execution adapter is not available yet, so approval records the decision "
     "without generating a flow specification."
@@ -58,7 +59,18 @@ class PipelineProposalEngine:
         match = re.search(r"(?:from|ingest)\s+([a-z_][\w]*(?:\.[a-z_][\w]*)?)", text)
         return match.group(1) if match else "public.customers"
 
+    @staticmethod
+    def check_patch(patch: PipelineProposalPatch) -> None:
+        """Only genuinely optional proposal fields may be cleared with an explicit null."""
+        rejected = sorted(
+            field for field in patch.model_fields_set
+            if getattr(patch, field) is None and field not in CLEARABLE_FIELDS
+        )
+        if rejected:
+            raise ValueError(f"These fields cannot be cleared: {', '.join(rejected)}")
+
     def revise(self, proposal: PipelineProposal, patch: PipelineProposalPatch, version: int) -> PipelineProposal:
+        self.check_patch(patch)
         updates = {field: getattr(patch, field) for field in patch.model_fields_set}
         changed = {field: value for field, value in updates.items() if getattr(proposal, field) != value}
         updates.update({"proposal_id": str(uuid4()), "version": version, "status": "draft",

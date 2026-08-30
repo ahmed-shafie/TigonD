@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 from uuid import uuid4
 
 import psycopg
@@ -164,14 +165,11 @@ class SourceRepository:
             self._audit(cursor, actor, "assistant.read", "conversation", conversation_id, "success")
         return response.model_copy(update={"conversation_id": conversation_id})
 
-    def next_proposal_version(self, assessment_id: str | None = None) -> int:
-        with self.connect() as db, db.cursor() as cursor:
-            return self._next_proposal_version(cursor, assessment_id)
-
-    def save_pipeline_proposal(self, proposal: PipelineProposal, assessment_id: str | None, actor: str, action: str = "proposal.generated") -> PipelineProposal:
+    def save_pipeline_proposal(self, build: Callable[[int], PipelineProposal], assessment_id: str | None, actor: str, action: str = "proposal.generated") -> PipelineProposal:
+        """Allocate the lineage version under lock, then build the proposal from it."""
         with self.connect() as db, db.cursor() as cursor:
             cursor.execute("SELECT pg_advisory_xact_lock(%s, hashtext(%s))", (PROPOSAL_VERSION_LOCK, assessment_id or ""))
-            stored = proposal.model_copy(update={"version": self._next_proposal_version(cursor, assessment_id)})
+            stored = build(self._next_proposal_version(cursor, assessment_id))
             cursor.execute("""INSERT INTO pipeline_proposals(id,assessment_id,version,status,requirement,spec,created_by)
                               VALUES (%s,%s,%s,'draft',%s,%s::jsonb,%s)""",
                            (stored.proposal_id, assessment_id, stored.version, stored.requirement,
@@ -205,8 +203,8 @@ class SourceRepository:
             raise KeyError(proposal_id)
         return row["assessment_id"]
 
-    def save_proposal_revision(self, proposal: PipelineProposal, assessment_id: str | None, actor: str) -> PipelineProposal:
-        return self.save_pipeline_proposal(proposal, assessment_id, actor, "proposal.revised")
+    def save_proposal_revision(self, build: Callable[[int], PipelineProposal], assessment_id: str | None, actor: str) -> PipelineProposal:
+        return self.save_pipeline_proposal(build, assessment_id, actor, "proposal.revised")
 
     def decide_pipeline_proposal(self, proposal_id: str, decision: str, reason: str | None, actor: str) -> PipelineProposal:
         with self.connect() as db, db.cursor() as cursor:
