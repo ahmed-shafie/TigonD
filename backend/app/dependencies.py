@@ -1,3 +1,5 @@
+from fastapi import Depends
+
 from .assistant import AssistantEngine
 from .application.use_cases.skills import BrowseSkills
 from .application.use_cases.assistant import AskAssistant
@@ -27,8 +29,8 @@ assistant = AssistantEngine(settings.ollama_url, settings.ollama_model, settings
 proposal_engine = PipelineProposalEngine()
 skill_browser = BrowseSkills(BuiltinSkillRegistry())
 operational_actions = OperationalActionService(PostgresOperationalActionStore(settings.metadata_database_url))
-intelligence_loop = IntelligenceLoop(PostgresIntelligenceStore(settings.metadata_database_url))
-platform_catalog = PlatformCatalog()
+intelligence_store = PostgresIntelligenceStore(settings.metadata_database_url)
+intelligence_loop = IntelligenceLoop(intelligence_store)
 
 
 def get_repository() -> SourceRepository:
@@ -63,5 +65,12 @@ def get_intelligence_loop() -> IntelligenceLoop:
     return intelligence_loop
 
 
-def get_platform_catalog() -> PlatformCatalog:
-    return platform_catalog
+def get_intelligence_store() -> PostgresIntelligenceStore:
+    return intelligence_store
+
+
+def get_platform_catalog(
+    repo: SourceRepository = Depends(get_repository),
+    incidents: PostgresIntelligenceStore = Depends(get_intelligence_store),
+) -> PlatformCatalog:
+    return PlatformCatalog(repo, incidents, skill_browser.registry)

@@ -5,7 +5,7 @@ from uuid import uuid4
 import psycopg
 from psycopg.rows import dict_row
 
-from .models import AssistantRequest, AssistantResponse, AuditEvent, FlowDeployment, NiFiFlowSpec, PipelineProposal, PostgresConnection, RegisteredSource, SourceAssessment
+from .models import AssistantRequest, AssistantResponse, AuditEvent, FlowDeployment, LineageFact, NiFiFlowSpec, PipelineProposal, PlatformSnapshot, PostgresConnection, RegisteredSource, SourceAssessment
 from .vault import MemorySecretStore, VaultSecretStore
 
 PROPOSAL_VERSION_LOCK = 8_312_001
@@ -125,6 +125,52 @@ class SourceRepository:
                 raise KeyError(deployment_id)
             self._audit(cursor, actor, f"nifi.flow.{status}", "deployment", deployment_id, "success")
         return self.get_deployment(deployment_id)
+
+    def list_deployments(self) -> list[FlowDeployment]:
+        with self.connect() as db, db.cursor() as cursor:
+            cursor.execute("SELECT * FROM flow_deployments ORDER BY updated_at DESC")
+            rows = cursor.fetchall()
+        return [
+            FlowDeployment(deployment_id=row["id"], assessment_id=row["assessment_id"], version=row["version"],
+                           external_flow_id=row["external_flow_id"], status=row["status"],
+                           flow_spec=NiFiFlowSpec.model_validate(row["flow_spec"] if isinstance(row["flow_spec"], dict) else json.loads(row["flow_spec"])))
+            for row in rows
+        ]
+
+    def platform_snapshot(self) -> PlatformSnapshot:
+        with self.connect() as db, db.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS count FROM sources")
+            sources = int(cursor.fetchone()["count"])
+            cursor.execute("SELECT status, COUNT(*) AS count FROM flow_deployments GROUP BY status")
+            deployments = {row["status"]: int(row["count"]) for row in cursor.fetchall()}
+            cursor.execute(
+                """SELECT COUNT(*) AS assessments,
+                          COUNT(*) FILTER (WHERE status = 'draft') AS pending_reviews,
+                          COALESCE(ROUND(AVG((payload->>'quality_score')::numeric), 1), 0) AS average_quality_score,
+                          COALESCE(SUM(jsonb_array_length(payload->'pii_columns')), 0) AS pii_columns,
+                          COALESCE(SUM(jsonb_array_length(payload->'pipeline_draft'->'quality_gates')), 0) AS quality_gates
+                     FROM source_assessments"""
+            )
+            row = cursor.fetchone()
+        return PlatformSnapshot(sources=sources, deployments=deployments, assessments=int(row["assessments"]),
+                                pending_reviews=int(row["pending_reviews"]), average_quality_score=float(row["average_quality_score"]),
+                                pii_columns=int(row["pii_columns"]), quality_gates=int(row["quality_gates"]))
+
+    def lineage_facts(self) -> list[LineageFact]:
+        with self.connect() as db, db.cursor() as cursor:
+            cursor.execute(
+                """SELECT s.id AS source_id, s.name AS source_name, a.schema_name, a.table_name, a.id AS assessment_id,
+                          COALESCE(a.payload->'pipeline_draft'->>'target_pattern', 'bronze/' || a.schema_name || '/' || a.table_name) AS target_pattern,
+                          COALESCE(jsonb_array_length(a.payload->'pipeline_draft'->'quality_gates'), 0) AS quality_gates,
+                          d.version AS deployment_version
+                     FROM source_assessments a
+                     JOIN sources s ON s.id = a.source_id
+                     LEFT JOIN LATERAL (
+                          SELECT version FROM flow_deployments WHERE assessment_id = a.id ORDER BY version DESC LIMIT 1
+                     ) d ON TRUE
+                    ORDER BY a.created_at"""
+            )
+            return [LineageFact(**row) for row in cursor.fetchall()]
 
     def assistant_context(self, assessment_id: str | None = None, deployment_id: str | None = None) -> dict:
         with self.connect() as db, db.cursor() as cursor:

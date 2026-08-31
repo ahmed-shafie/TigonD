@@ -374,6 +374,27 @@ class WorkspaceSummary(BaseModel):
     actions: list[str]
 
 
+class PlatformSnapshot(BaseModel):
+    sources: int
+    deployments: dict[str, int]
+    assessments: int
+    pending_reviews: int
+    average_quality_score: float
+    pii_columns: int
+    quality_gates: int
+
+
+class LineageFact(BaseModel):
+    source_id: str
+    source_name: str
+    schema_name: str
+    table_name: str
+    assessment_id: str
+    target_pattern: str
+    quality_gates: int
+    deployment_version: int | None = None
+
+
 
 
 

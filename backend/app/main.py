@@ -237,6 +237,11 @@ def nifi_flow_status(
         raise HTTPException(status_code=502, detail="NiFi status unavailable") from exc
 
 
+@app.get("/api/v1/deployments", response_model=list[FlowDeployment])
+def list_deployments(repo: SourceRepository = Depends(get_repository), _: Principal = Depends(require_roles("administrator", "developer", "operator", "quality", "governance"))):
+    return repo.list_deployments()
+
+
 @app.get("/api/v1/audit", response_model=list[AuditEvent])
 def audit_events(repo: SourceRepository = Depends(get_repository), _: Principal = Depends(require_roles("administrator", "governance"))):
     return repo.list_audit()

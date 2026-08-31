@@ -2,7 +2,8 @@ from collections.abc import Callable
 from typing import Protocol
 
 from ...models import (AssistantRequest, AssistantResponse, IncidentDiagnosis,
-                       MemoryRecord, OperationalAction, PipelineProposal,
+                       LineageFact, MemoryRecord, OperationalAction,
+                       PipelineProposal, PlatformSnapshot,
                        RecommendationFeedback, SourceAssessment)
 
 
@@ -33,6 +34,11 @@ class IntelligenceStore(Protocol):
     def search_memory(self, terms: list[str], scope: str | None) -> list[MemoryRecord]: ...
     def add_feedback(self, item: RecommendationFeedback) -> None: ...
     def feedback_totals(self) -> tuple[int, int, int]: ...
+
+
+class PlatformReader(Protocol):
+    def platform_snapshot(self) -> PlatformSnapshot: ...
+    def lineage_facts(self) -> list[LineageFact]: ...
 
 
 class AssistantRepository(Protocol):

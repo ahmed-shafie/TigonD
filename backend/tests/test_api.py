@@ -1,8 +1,10 @@
 from fastapi.testclient import TestClient
 
 from app.config import Settings, get_settings
+from app.dependencies import get_intelligence_store
+from app.infrastructure.intelligence_store import InMemoryIntelligenceStore
 from app.main import app, get_nifi, get_postgres, get_repository
-from app.models import ColumnProfile, ConnectionTestResult, FlowDeployment, NiFiStatus, RegisteredSource, TableProfile
+from app.models import ColumnProfile, ConnectionTestResult, FlowDeployment, LineageFact, NiFiStatus, PlatformSnapshot, RegisteredSource, TableProfile
 
 
 class FakePostgres:
@@ -24,6 +26,8 @@ class FakePostgres:
 class FakeRepository:
     def __init__(self):
         self.source = None
+        self.assessment = None
+        self.deployment = None
         self.proposals = {}
 
     def create(self, connection, actor):
@@ -43,7 +47,7 @@ class FakeRepository:
 
     def decide_assessment(self, assessment_id, decision, reason, actor):
         self.last_decision = (assessment_id, decision, reason, actor)
-        if getattr(self, "assessment", None):
+        if self.assessment:
             self.assessment = self.assessment.model_copy(update={"pipeline_draft": self.assessment.pipeline_draft.model_copy(update={"status": decision})})
 
     def get_assessment(self, _assessment_id):
@@ -60,13 +64,36 @@ class FakeRepository:
     def get_deployment(self, _deployment_id):
         return self.deployment
 
+    def list_deployments(self):
+        return [self.deployment] if self.deployment else []
+
+    def platform_snapshot(self):
+        assessment = self.assessment
+        return PlatformSnapshot(sources=1 if self.source else 0,
+                                deployments={self.deployment.status: 1} if self.deployment else {},
+                                assessments=1 if assessment else 0,
+                                pending_reviews=1 if assessment and assessment.pipeline_draft.status == "draft" else 0,
+                                average_quality_score=assessment.quality_score if assessment else 0,
+                                pii_columns=len(assessment.pii_columns) if assessment else 0,
+                                quality_gates=len(assessment.pipeline_draft.quality_gates) if assessment else 0)
+
+    def lineage_facts(self):
+        assessment = self.assessment
+        if not assessment:
+            return []
+        return [LineageFact(source_id=assessment.source_id, source_name=self.source.name, schema_name=assessment.schema_name,
+                            table_name=assessment.table_name, assessment_id=assessment.assessment_id,
+                            target_pattern=assessment.pipeline_draft.target_pattern,
+                            quality_gates=len(assessment.pipeline_draft.quality_gates),
+                            deployment_version=self.deployment.version if self.deployment else None)]
+
     def update_deployment(self, _deployment_id, status, _actor, external_flow_id=None):
         self.deployment = self.deployment.model_copy(update={"status": status, "external_flow_id": external_flow_id or self.deployment.external_flow_id})
         return self.deployment
 
     def assistant_context(self, assessment_id=None, deployment_id=None):
-        assessment = getattr(self, "assessment", None)
-        deployment = getattr(self, "deployment", None)
+        assessment = self.assessment
+        deployment = self.deployment
         payload = assessment.model_dump() if assessment else None
         flow = {"version": deployment.version, "status": deployment.status} if deployment else None
         return {"source_count": 1 if self.source else 0, "deployment_count": 1 if deployment else 0,
@@ -134,6 +161,7 @@ def setup_function():
     app.dependency_overrides[get_postgres] = lambda: FakePostgres()
     app.dependency_overrides[get_repository] = lambda: fake_repo
     app.dependency_overrides[get_nifi] = lambda: FakeNiFi()
+    app.dependency_overrides[get_intelligence_store] = lambda: InMemoryIntelligenceStore()
 
 
 def teardown_function():
@@ -372,6 +400,36 @@ def test_revision_rejecting_a_cleared_required_field_returns_422():
                                    json={"target_pattern": None})
     assert response.status_code == 422
     assert "target_pattern" in response.json()["detail"]
+
+
+def test_workspaces_and_lineage_report_registered_evidence():
+    client = TestClient(app)
+    client.post("/api/v1/sources", json=payload())
+    client.post("/api/v1/sources/source-1/assess/public/customers", json={
+        "desired_latency": "daily", "transformation_complexity": "high",
+        "prefer_visual_design": True, "packaged_connector_available": True,
+    })
+    cards = {item["workspace"]: item["cards"] for item in client.get("/api/v1/platform/workspaces").json()}
+    assert cards["governance"]["connected_sources"] == 1
+    assert cards["data_quality"]["average_score"] == fake_repo.assessment.quality_score
+    assert cards["governance"]["pii_columns"] == len(fake_repo.assessment.pii_columns)
+    graph = client.get("/api/v1/platform/lineage").json()
+    assert graph["nodes"][0]["label"] == "CRM Production"
+    assert graph["nodes"][1]["label"] == "public.customers"
+
+
+def test_deployments_can_be_listed_for_the_operations_workspace():
+    client = TestClient(app)
+    client.post("/api/v1/sources", json=payload())
+    assessment = client.post("/api/v1/sources/source-1/assess/public/customers", json={
+        "desired_latency": "daily", "transformation_complexity": "high",
+        "prefer_visual_design": True, "packaged_connector_available": True,
+    }).json()
+    client.post(f"/api/v1/assessments/{assessment['assessment_id']}/decision", json={"decision": "approved", "reason": "Evidence accepted"})
+    client.post(f"/api/v1/assessments/{assessment['assessment_id']}/nifi/generate")
+    body = client.get("/api/v1/deployments").json()
+    assert [item["deployment_id"] for item in body] == ["deployment-1"]
+    assert body[0]["status"] == "generated"
 
 
 def test_browser_can_preflight_a_proposal_revision():
