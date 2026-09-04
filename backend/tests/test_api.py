@@ -1,8 +1,10 @@
 from fastapi.testclient import TestClient
 
 from app.config import Settings, get_settings
+from app.dependencies import get_intelligence_store
+from app.infrastructure.intelligence_store import InMemoryIntelligenceStore
 from app.main import app, get_nifi, get_postgres, get_repository
-from app.models import ColumnProfile, ConnectionTestResult, FlowDeployment, NiFiStatus, RegisteredSource, TableProfile
+from app.models import ColumnProfile, ConnectionTestResult, FlowDeployment, LineageFact, NiFiStatus, PlatformSnapshot, RegisteredSource, TableProfile
 
 
 class FakePostgres:
@@ -24,6 +26,8 @@ class FakePostgres:
 class FakeRepository:
     def __init__(self):
         self.source = None
+        self.assessment = None
+        self.deployment = None
         self.proposals = {}
 
     def create(self, connection, actor):
@@ -43,7 +47,7 @@ class FakeRepository:
 
     def decide_assessment(self, assessment_id, decision, reason, actor):
         self.last_decision = (assessment_id, decision, reason, actor)
-        if getattr(self, "assessment", None):
+        if self.assessment:
             self.assessment = self.assessment.model_copy(update={"pipeline_draft": self.assessment.pipeline_draft.model_copy(update={"status": decision})})
 
     def get_assessment(self, _assessment_id):
@@ -60,13 +64,36 @@ class FakeRepository:
     def get_deployment(self, _deployment_id):
         return self.deployment
 
+    def list_deployments(self):
+        return [self.deployment] if self.deployment else []
+
+    def platform_snapshot(self):
+        assessment = self.assessment
+        return PlatformSnapshot(sources=1 if self.source else 0,
+                                deployments={self.deployment.status: 1} if self.deployment else {},
+                                assessments=1 if assessment else 0,
+                                pending_reviews=1 if assessment and assessment.pipeline_draft.status == "draft" else 0,
+                                average_quality_score=assessment.quality_score if assessment else 0,
+                                pii_columns=len(assessment.pii_columns) if assessment else 0,
+                                quality_gates=len(assessment.pipeline_draft.quality_gates) if assessment else 0)
+
+    def lineage_facts(self):
+        assessment = self.assessment
+        if not assessment:
+            return []
+        return [LineageFact(source_id=assessment.source_id, source_name=self.source.name, schema_name=assessment.schema_name,
+                            table_name=assessment.table_name, assessment_id=assessment.assessment_id,
+                            target_pattern=assessment.pipeline_draft.target_pattern,
+                            quality_gates=len(assessment.pipeline_draft.quality_gates),
+                            deployment_version=self.deployment.version if self.deployment else None)]
+
     def update_deployment(self, _deployment_id, status, _actor, external_flow_id=None):
         self.deployment = self.deployment.model_copy(update={"status": status, "external_flow_id": external_flow_id or self.deployment.external_flow_id})
         return self.deployment
 
     def assistant_context(self, assessment_id=None, deployment_id=None):
-        assessment = getattr(self, "assessment", None)
-        deployment = getattr(self, "deployment", None)
+        assessment = self.assessment
+        deployment = self.deployment
         payload = assessment.model_dump() if assessment else None
         flow = {"version": deployment.version, "status": deployment.status} if deployment else None
         return {"source_count": 1 if self.source else 0, "deployment_count": 1 if deployment else 0,
@@ -78,10 +105,8 @@ class FakeRepository:
         self.last_assistant_actor = actor
         return response.model_copy(update={"conversation_id": request.conversation_id or "conversation-1"})
 
-    def next_proposal_version(self):
-        return len(self.proposals) + 1
-
-    def save_pipeline_proposal(self, proposal, assessment_id, actor):
+    def save_pipeline_proposal(self, build, assessment_id, actor):
+        proposal = build(len(self.proposals) + 1)
         self.proposal = proposal
         self.proposal_assessment_id = assessment_id
         self.proposals[proposal.proposal_id] = proposal
@@ -93,10 +118,11 @@ class FakeRepository:
     def get_proposal_assessment_id(self, _proposal_id):
         return self.proposal_assessment_id
 
-    def save_proposal_revision(self, proposal, assessment_id, actor):
-        return self.save_pipeline_proposal(proposal, assessment_id, actor)
+    def save_proposal_revision(self, build, assessment_id, actor):
+        return self.save_pipeline_proposal(build, assessment_id, actor)
 
     def decide_pipeline_proposal(self, proposal_id, decision, reason, actor):
+        self.proposal_decision = (proposal_id, decision, reason, actor)
         self.proposal = self.proposals[proposal_id].model_copy(update={"status": decision})
         self.proposals[proposal_id] = self.proposal
         return self.proposal
@@ -135,6 +161,7 @@ def setup_function():
     app.dependency_overrides[get_postgres] = lambda: FakePostgres()
     app.dependency_overrides[get_repository] = lambda: fake_repo
     app.dependency_overrides[get_nifi] = lambda: FakeNiFi()
+    app.dependency_overrides[get_intelligence_store] = lambda: InMemoryIntelligenceStore()
 
 
 def teardown_function():
@@ -143,6 +170,40 @@ def teardown_function():
 
 def test_health():
     assert TestClient(app).get("/health").json()["status"] == "healthy"
+
+
+def test_skill_catalog_preserves_role_and_approval_boundaries():
+    response = TestClient(app).get("/api/v1/skills")
+    assert response.status_code == 200
+    skills = {item["key"]: item for item in response.json()}
+    assert skills["source-profile"]["implemented"] is True
+    assert skills["nifi-deploy"]["requires_approval"] is True
+    assert "incident-diagnosis" not in skills
+
+
+def test_public_api_contract_contains_all_phase_32_routes():
+    paths = TestClient(app).get("/openapi.json").json()["paths"]
+    expected = {
+        "/api/v1/sources/test",
+        "/api/v1/sources/{source_id}/objects",
+        "/api/v1/sources/{source_id}/assess/{schema_name}/{table_name}",
+        "/api/v1/assistant/chat",
+        "/api/v1/pipeline-proposals",
+        "/api/v1/pipeline-proposals/{proposal_id}/validate",
+        "/api/v1/pipeline-proposals/{proposal_id}/decision",
+        "/api/v1/skills",
+        "/api/v1/operational-actions",
+        "/api/v1/operational-actions/{action_id}/decision",
+        "/api/v1/operational-actions/{action_id}/execute",
+        "/api/v1/intelligence/diagnoses",
+        "/api/v1/intelligence/memory/search",
+        "/api/v1/intelligence/insights",
+        "/api/v1/platform/connectors",
+        "/api/v1/platform/runtimes",
+        "/api/v1/platform/lineage",
+        "/api/v1/platform/workspaces",
+    }
+    assert expected.issubset(paths)
 
 
 def test_connection_contract():
@@ -256,6 +317,8 @@ def test_natural_language_requirement_creates_non_executable_proposal():
     assert fetched.status_code == 200
     assert fetched.json()["proposal_id"] == body["proposal_id"]
 
+    TestClient(app).post(f"/api/v1/assessments/{assessment_id}/decision", json={"decision": "approved"})
+
     revised = TestClient(app).put(f"/api/v1/pipeline-proposals/{body['proposal_id']}", json={
         "schedule":"0 */2 * * *", "quality_gates":["completeness >= 98%", "route invalid records to quarantine"]
     })
@@ -266,7 +329,113 @@ def test_natural_language_requirement_creates_non_executable_proposal():
     assert validation.json()["valid"] is True
     assert validation.json()["changes_from_previous"]
 
-    approved = TestClient(app).post(f"/api/v1/pipeline-proposals/{revised.json()['proposal_id']}/decision", json={"decision":"approved"})
+    approved = TestClient(app).post(f"/api/v1/pipeline-proposals/{revised.json()['proposal_id']}/decision",
+                                    json={"decision":"approved", "reason":"Reviewed with the data owner"})
     assert approved.status_code == 200
     assert approved.json()["proposal"]["status"] == "approved"
     assert approved.json()["deployment"]["status"] == "generated"
+    assert approved.json()["compiled"] is True
+    assert fake_repo.proposal_decision[2] == "Reviewed with the data owner"
+
+
+def test_proposal_cannot_compile_while_the_assessment_is_not_approved():
+    TestClient(app).post("/api/v1/sources", json=payload())
+    assessment_id = TestClient(app).post("/api/v1/sources/source-1/assess/public/customers", json={
+        "desired_latency":"daily", "transformation_complexity":"high",
+        "prefer_visual_design":True, "packaged_connector_available":True,
+    }).json()["assessment_id"]
+    TestClient(app).post(f"/api/v1/assessments/{assessment_id}/decision", json={"decision": "rejected", "reason": "Quality too low"})
+    proposal = TestClient(app).post("/api/v1/pipeline-proposals", json={
+        "requirement":"Ingest customers incrementally every hour and quarantine invalid records.",
+        "assessment_id": assessment_id,
+    }).json()
+
+    response = TestClient(app).post(f"/api/v1/pipeline-proposals/{proposal['proposal_id']}/decision", json={"decision":"approved"})
+    assert response.status_code == 409
+    assert "approved by a human" in response.json()["detail"]
+
+
+def test_cdc_proposal_is_approved_without_compilation_until_its_adapter_exists():
+    TestClient(app).post("/api/v1/sources", json=payload())
+    assessment_id = TestClient(app).post("/api/v1/sources/source-1/assess/public/customers", json={
+        "desired_latency":"daily", "transformation_complexity":"high",
+        "prefer_visual_design":True, "packaged_connector_available":True,
+    }).json()["assessment_id"]
+    TestClient(app).post(f"/api/v1/assessments/{assessment_id}/decision", json={"decision": "approved"})
+    proposal = TestClient(app).post("/api/v1/pipeline-proposals", json={
+        "requirement":"Ingest public.transactions in real-time with CDC into the bronze zone.",
+        "assessment_id": assessment_id,
+    }).json()
+    assert proposal["runtime"] == "kafka_debezium"
+
+    response = TestClient(app).post(f"/api/v1/pipeline-proposals/{proposal['proposal_id']}/decision", json={"decision":"approved"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["proposal"]["status"] == "approved"
+    assert body["compiled"] is False
+    assert body["deployment"] is None
+    assert "kafka_debezium" in body["compilation_note"]
+
+
+def test_standalone_cdc_proposal_is_approved_without_an_assessment():
+    proposal = TestClient(app).post("/api/v1/pipeline-proposals", json={
+        "requirement":"Ingest public.transactions in real-time with CDC into the bronze zone.",
+    }).json()
+    assert proposal["runtime"] == "kafka_debezium"
+
+    response = TestClient(app).post(f"/api/v1/pipeline-proposals/{proposal['proposal_id']}/decision", json={"decision":"approved"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["proposal"]["status"] == "approved"
+    assert body["compiled"] is False
+    assert "kafka_debezium" in body["compilation_note"]
+
+
+def test_revision_rejecting_a_cleared_required_field_returns_422():
+    proposal = TestClient(app).post("/api/v1/pipeline-proposals", json={
+        "requirement":"Ingest customers incrementally every hour and quarantine invalid records.",
+    }).json()
+
+    response = TestClient(app).put(f"/api/v1/pipeline-proposals/{proposal['proposal_id']}",
+                                   json={"target_pattern": None})
+    assert response.status_code == 422
+    assert "target_pattern" in response.json()["detail"]
+
+
+def test_workspaces_and_lineage_report_registered_evidence():
+    client = TestClient(app)
+    client.post("/api/v1/sources", json=payload())
+    client.post("/api/v1/sources/source-1/assess/public/customers", json={
+        "desired_latency": "daily", "transformation_complexity": "high",
+        "prefer_visual_design": True, "packaged_connector_available": True,
+    })
+    cards = {item["workspace"]: item["cards"] for item in client.get("/api/v1/platform/workspaces").json()}
+    assert cards["governance"]["connected_sources"] == 1
+    assert cards["data_quality"]["average_score"] == fake_repo.assessment.quality_score
+    assert cards["governance"]["pii_columns"] == len(fake_repo.assessment.pii_columns)
+    graph = client.get("/api/v1/platform/lineage").json()
+    assert graph["nodes"][0]["label"] == "CRM Production"
+    assert graph["nodes"][1]["label"] == "public.customers"
+
+
+def test_deployments_can_be_listed_for_the_operations_workspace():
+    client = TestClient(app)
+    client.post("/api/v1/sources", json=payload())
+    assessment = client.post("/api/v1/sources/source-1/assess/public/customers", json={
+        "desired_latency": "daily", "transformation_complexity": "high",
+        "prefer_visual_design": True, "packaged_connector_available": True,
+    }).json()
+    client.post(f"/api/v1/assessments/{assessment['assessment_id']}/decision", json={"decision": "approved", "reason": "Evidence accepted"})
+    client.post(f"/api/v1/assessments/{assessment['assessment_id']}/nifi/generate")
+    body = client.get("/api/v1/deployments").json()
+    assert [item["deployment_id"] for item in body] == ["deployment-1"]
+    assert body[0]["status"] == "generated"
+
+
+def test_browser_can_preflight_a_proposal_revision():
+    response = TestClient(app).options("/api/v1/pipeline-proposals/proposal-1", headers={
+        "Origin": "http://localhost:3000",
+        "Access-Control-Request-Method": "PUT",
+    })
+    assert response.status_code == 200
+    assert "PUT" in response.headers["access-control-allow-methods"]

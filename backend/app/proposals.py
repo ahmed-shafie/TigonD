@@ -3,6 +3,13 @@ from uuid import uuid4
 
 from .models import ColumnMapping, PipelineProposal, PipelineProposalPatch, PipelineProposalRequest, ProposalValidation, SourceAssessment
 
+COMPILABLE_RUNTIMES = frozenset({"nifi"})
+CLEARABLE_FIELDS = frozenset({"business_key", "watermark_column"})
+RUNTIME_ADAPTER_NOTE = (
+    "The {runtime} execution adapter is not available yet, so approval records the decision "
+    "without generating a flow specification."
+)
+
 
 class PipelineProposalEngine:
     """Turns a natural-language requirement into a deterministic, reviewable draft."""
@@ -52,12 +59,25 @@ class PipelineProposalEngine:
         match = re.search(r"(?:from|ingest)\s+([a-z_][\w]*(?:\.[a-z_][\w]*)?)", text)
         return match.group(1) if match else "public.customers"
 
+    @staticmethod
+    def check_patch(patch: PipelineProposalPatch) -> None:
+        """Only genuinely optional proposal fields may be cleared with an explicit null."""
+        rejected = sorted(
+            field for field, value in patch
+            if field in patch.model_fields_set and value is None and field not in CLEARABLE_FIELDS
+        )
+        if rejected:
+            raise ValueError(f"These fields cannot be cleared: {', '.join(rejected)}")
+
     def revise(self, proposal: PipelineProposal, patch: PipelineProposalPatch, version: int) -> PipelineProposal:
-        updates = patch.model_dump(exclude_none=True)
+        self.check_patch(patch)
+        updates = {field: value for field, value in patch if field in patch.model_fields_set}
+        current = dict(proposal)
+        changed = {field: value for field, value in updates.items() if current[field] != value}
         updates.update({"proposal_id": str(uuid4()), "version": version, "status": "draft",
                         "parent_proposal_id": proposal.proposal_id, "execution_allowed": False})
         revised = proposal.model_copy(update=updates)
-        revised.confidence = max(50, proposal.confidence - (2 if updates else 0))
+        revised.confidence = max(50, proposal.confidence - (2 if changed else 0))
         revised.explanation = f"Version {version} applies reviewed visual-editor changes to version {proposal.version}. It remains non-executable until revalidated and approved."
         return revised
 
@@ -71,6 +91,8 @@ class PipelineProposalEngine:
             blockers.append("Incremental load requires a watermark column")
         if proposal.load_strategy == "cdc" and proposal.runtime != "kafka_debezium":
             blockers.append("CDC proposals require Kafka + Debezium runtime")
+        if proposal.runtime not in COMPILABLE_RUNTIMES:
+            warnings.append(RUNTIME_ADAPTER_NOTE.format(runtime=proposal.runtime))
         if not proposal.quality_gates:
             warnings.append("No quality gate protects the target")
         if not proposal.business_key:
@@ -78,9 +100,11 @@ class PipelineProposalEngine:
         warnings.extend(proposal.risks)
         changes = []
         if previous:
-            for field in ("runtime", "load_strategy", "schedule", "target_pattern", "business_key", "watermark_column"):
-                if getattr(previous, field) != getattr(proposal, field):
-                    changes.append(f"{field}: {getattr(previous, field)} → {getattr(proposal, field)}")
+            compared = ("runtime", "load_strategy", "schedule", "target_pattern", "business_key", "watermark_column")
+            before, after = dict(previous), dict(proposal)
+            for field in compared:
+                if before[field] != after[field]:
+                    changes.append(f"{field}: {before[field]} → {after[field]}")
             if previous.mappings != proposal.mappings:
                 changes.append(f"mappings changed: {len(previous.mappings)} → {len(proposal.mappings)}")
             if previous.quality_gates != proposal.quality_gates:

@@ -6,50 +6,35 @@ from psycopg import Error as PostgresError
 from .auth import Principal, current_principal, require_roles
 from .assistant import AssistantEngine
 from .config import get_settings
-from .intelligence import IntelligenceEngine
+from .dependencies import (assistant, get_assistant, get_nifi, get_postgres,
+                           get_repository, intelligence, nifi_client,
+                           nifi_compiler, postgres, proposal_engine, repository,
+                           settings)
 from .models import (AssistantRequest, AssistantResponse, AssessmentRequest, AuditEvent, ConnectionTestResult, DataObject, FlowDeployment, NiFiStatus, PipelineProposal, PipelineProposalPatch, PipelineProposalRequest, ProposalApprovalResult, ProposalDecision, ProposalValidation,
                      PostgresConnection, RecommendationDecision, RegisteredSource, SourceAssessment, TableProfile)
-from .nifi import NiFiClient, NiFiError, NiFiFlowCompiler
-from .proposals import PipelineProposalEngine
+from .nifi import NiFiClient, NiFiError
+from .proposals import COMPILABLE_RUNTIMES, RUNTIME_ADAPTER_NOTE
 from .postgres import PostgresService
+from .presentation.api.routers.skills import router as skills_router
+from .presentation.api.routers.assistant import router as assistant_router
+from .presentation.api.routers.operations import router as operations_router
+from .presentation.api.routers.intelligence import router as intelligence_router
+from .presentation.api.routers.platform import router as platform_router
 from .repository import SourceRepository
-from .vault import VaultSecretStore
-
-
-settings = get_settings()
-secret_store = VaultSecretStore(settings.vault_url, settings.vault_token, settings.vault_mount)
-repository = SourceRepository(settings.metadata_database_url, secret_store)
-postgres = PostgresService(settings.query_timeout_seconds, settings.profile_sample_rows)
-intelligence = IntelligenceEngine()
-nifi_compiler = NiFiFlowCompiler()
-nifi_client = NiFiClient(settings.nifi_url, settings.nifi_username, settings.nifi_password, settings.nifi_verify_ssl)
-assistant = AssistantEngine(settings.ollama_url, settings.ollama_model, settings.ollama_enabled)
-proposal_engine = PipelineProposalEngine()
 
 app = FastAPI(title="TigonD Ingestion API", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
     allow_headers=["*"],
 )
-
-
-def get_repository() -> SourceRepository:
-    return repository
-
-
-def get_postgres() -> PostgresService:
-    return postgres
-
-
-def get_nifi() -> NiFiClient:
-    return nifi_client
-
-
-def get_assistant() -> AssistantEngine:
-    return assistant
+app.include_router(skills_router)
+app.include_router(assistant_router)
+app.include_router(operations_router)
+app.include_router(intelligence_router)
+app.include_router(platform_router)
 
 
 @app.get("/health")
@@ -252,21 +237,14 @@ def nifi_flow_status(
         raise HTTPException(status_code=502, detail="NiFi status unavailable") from exc
 
 
+@app.get("/api/v1/deployments", response_model=list[FlowDeployment])
+def list_deployments(repo: SourceRepository = Depends(get_repository), _: Principal = Depends(require_roles("administrator", "developer", "operator", "quality", "governance"))):
+    return repo.list_deployments()
+
+
 @app.get("/api/v1/audit", response_model=list[AuditEvent])
 def audit_events(repo: SourceRepository = Depends(get_repository), _: Principal = Depends(require_roles("administrator", "governance"))):
     return repo.list_audit()
-
-
-@app.post("/api/v1/assistant/chat", response_model=AssistantResponse)
-def assistant_chat(
-    request: AssistantRequest,
-    repo: SourceRepository = Depends(get_repository),
-    engine: AssistantEngine = Depends(get_assistant),
-    principal: Principal = Depends(require_roles("administrator", "developer", "operator", "quality", "governance")),
-):
-    context = repo.assistant_context(request.assessment_id, request.deployment_id)
-    response = engine.answer(request, context)
-    return repo.save_assistant_exchange(request, response, principal.username)
 
 
 @app.post("/api/v1/pipeline-proposals", response_model=PipelineProposal, status_code=status.HTTP_201_CREATED)
@@ -277,8 +255,10 @@ def create_pipeline_proposal(
 ):
     try:
         assessment = repo.get_assessment(request.assessment_id) if request.assessment_id else None
-        proposal = proposal_engine.compile(request, assessment, repo.next_proposal_version())
-        return repo.save_pipeline_proposal(proposal, request.assessment_id, principal.username)
+        return repo.save_pipeline_proposal(
+            lambda version: proposal_engine.compile(request, assessment, version),
+            request.assessment_id, principal.username,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Assessment not found") from exc
 
@@ -304,10 +284,16 @@ def revise_pipeline_proposal(
 ):
     try:
         current = repo.get_pipeline_proposal(proposal_id)
-        revised = proposal_engine.revise(current, patch, repo.next_proposal_version())
-        return repo.save_proposal_revision(revised, repo.get_proposal_assessment_id(proposal_id), principal.username)
+        assessment_id = repo.get_proposal_assessment_id(proposal_id)
+        proposal_engine.check_patch(patch)
+        return repo.save_proposal_revision(
+            lambda version: proposal_engine.revise(current, patch, version),
+            assessment_id, principal.username,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Pipeline proposal not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/pipeline-proposals/{proposal_id}/validate", response_model=ProposalValidation)
@@ -341,24 +327,29 @@ def decide_pipeline_proposal(
             raise ValueError("Proposal has validation blockers")
         deployment = None
         spec = None
+        note = None
         if decision.decision == "approved":
-            assessment_id = repo.get_proposal_assessment_id(proposal_id)
-            if not assessment_id:
-                raise ValueError("An evidence-based source assessment is required before NiFi compilation")
-            if proposal.runtime != "nifi":
-                raise ValueError("Only NiFi proposals can compile until the selected runtime adapter is available")
-            assessment = repo.get_assessment(assessment_id)
-            draft = assessment.pipeline_draft.model_copy(update={
-                "load_strategy": proposal.load_strategy, "business_key": proposal.business_key,
-                "watermark_column": proposal.watermark_column, "target_pattern": proposal.target_pattern,
-                "quality_gates": proposal.quality_gates, "status": "approved",
-            })
-            compiled_assessment = assessment.model_copy(update={"pipeline_draft": draft, "recommended_runtime": proposal.runtime})
-            spec = nifi_compiler.compile(compiled_assessment, repo.next_flow_version(assessment_id))
+            if proposal.runtime in COMPILABLE_RUNTIMES:
+                assessment_id = repo.get_proposal_assessment_id(proposal_id)
+                if not assessment_id:
+                    raise ValueError("An evidence-based source assessment is required before NiFi compilation")
+                assessment = repo.get_assessment(assessment_id)
+                if assessment.pipeline_draft.status != "approved":
+                    raise ValueError("The source assessment must be approved by a human before compilation")
+                draft = assessment.pipeline_draft.model_copy(update={
+                    "load_strategy": proposal.load_strategy, "business_key": proposal.business_key,
+                    "watermark_column": proposal.watermark_column, "target_pattern": proposal.target_pattern,
+                    "quality_gates": proposal.quality_gates,
+                })
+                compiled_assessment = assessment.model_copy(update={"pipeline_draft": draft, "recommended_runtime": proposal.runtime})
+                spec = nifi_compiler.compile(compiled_assessment, repo.next_flow_version(assessment_id))
+            else:
+                note = RUNTIME_ADAPTER_NOTE.format(runtime=proposal.runtime)
         approved = repo.decide_pipeline_proposal(proposal_id, decision.decision, decision.reason, principal.username)
         if spec is not None:
             deployment = repo.save_generated_flow(assessment_id, spec, principal.username)
-        return ProposalApprovalResult(proposal=approved, validation=validation, deployment=deployment)
+        return ProposalApprovalResult(proposal=approved, validation=validation, deployment=deployment,
+                                      compiled=spec is not None, compilation_note=note)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Pipeline proposal not found") from exc
     except ValueError as exc:

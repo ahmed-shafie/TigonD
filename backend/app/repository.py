@@ -1,11 +1,14 @@
 import json
+from collections.abc import Callable
 from uuid import uuid4
 
 import psycopg
 from psycopg.rows import dict_row
 
-from .models import AssistantRequest, AssistantResponse, AuditEvent, FlowDeployment, NiFiFlowSpec, PipelineProposal, PostgresConnection, RegisteredSource, SourceAssessment
+from .models import AssistantRequest, AssistantResponse, AuditEvent, FlowDeployment, LineageFact, NiFiFlowSpec, PipelineProposal, PlatformSnapshot, PostgresConnection, RegisteredSource, SourceAssessment
 from .vault import MemorySecretStore, VaultSecretStore
+
+PROPOSAL_VERSION_LOCK = 8_312_001
 
 
 class SourceRepository:
@@ -123,6 +126,52 @@ class SourceRepository:
             self._audit(cursor, actor, f"nifi.flow.{status}", "deployment", deployment_id, "success")
         return self.get_deployment(deployment_id)
 
+    def list_deployments(self) -> list[FlowDeployment]:
+        with self.connect() as db, db.cursor() as cursor:
+            cursor.execute("SELECT * FROM flow_deployments ORDER BY updated_at DESC")
+            rows = cursor.fetchall()
+        return [
+            FlowDeployment(deployment_id=row["id"], assessment_id=row["assessment_id"], version=row["version"],
+                           external_flow_id=row["external_flow_id"], status=row["status"],
+                           flow_spec=NiFiFlowSpec.model_validate(row["flow_spec"] if isinstance(row["flow_spec"], dict) else json.loads(row["flow_spec"])))
+            for row in rows
+        ]
+
+    def platform_snapshot(self) -> PlatformSnapshot:
+        with self.connect() as db, db.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS count FROM sources")
+            sources = int(cursor.fetchone()["count"])
+            cursor.execute("SELECT status, COUNT(*) AS count FROM flow_deployments GROUP BY status")
+            deployments = {row["status"]: int(row["count"]) for row in cursor.fetchall()}
+            cursor.execute(
+                """SELECT COUNT(*) AS assessments,
+                          COUNT(*) FILTER (WHERE status = 'draft') AS pending_reviews,
+                          COALESCE(ROUND(AVG((payload->>'quality_score')::numeric), 1), 0) AS average_quality_score,
+                          COALESCE(SUM(jsonb_array_length(payload->'pii_columns')), 0) AS pii_columns,
+                          COALESCE(SUM(jsonb_array_length(payload->'pipeline_draft'->'quality_gates')), 0) AS quality_gates
+                     FROM source_assessments"""
+            )
+            row = cursor.fetchone()
+        return PlatformSnapshot(sources=sources, deployments=deployments, assessments=int(row["assessments"]),
+                                pending_reviews=int(row["pending_reviews"]), average_quality_score=float(row["average_quality_score"]),
+                                pii_columns=int(row["pii_columns"]), quality_gates=int(row["quality_gates"]))
+
+    def lineage_facts(self) -> list[LineageFact]:
+        with self.connect() as db, db.cursor() as cursor:
+            cursor.execute(
+                """SELECT s.id AS source_id, s.name AS source_name, a.schema_name, a.table_name, a.id AS assessment_id,
+                          COALESCE(a.payload->'pipeline_draft'->>'target_pattern', 'bronze/' || a.schema_name || '/' || a.table_name) AS target_pattern,
+                          COALESCE(jsonb_array_length(a.payload->'pipeline_draft'->'quality_gates'), 0) AS quality_gates,
+                          d.version AS deployment_version
+                     FROM source_assessments a
+                     JOIN sources s ON s.id = a.source_id
+                     LEFT JOIN LATERAL (
+                          SELECT version FROM flow_deployments WHERE assessment_id = a.id ORDER BY version DESC LIMIT 1
+                     ) d ON TRUE
+                    ORDER BY a.created_at"""
+            )
+            return [LineageFact(**row) for row in cursor.fetchall()]
+
     def assistant_context(self, assessment_id: str | None = None, deployment_id: str | None = None) -> dict:
         with self.connect() as db, db.cursor() as cursor:
             cursor.execute("SELECT COUNT(*) AS count FROM sources")
@@ -162,19 +211,25 @@ class SourceRepository:
             self._audit(cursor, actor, "assistant.read", "conversation", conversation_id, "success")
         return response.model_copy(update={"conversation_id": conversation_id})
 
-    def next_proposal_version(self) -> int:
+    def save_pipeline_proposal(self, build: Callable[[int], PipelineProposal], assessment_id: str | None, actor: str, action: str = "proposal.generated") -> PipelineProposal:
+        """Allocate the lineage version under lock, then build the proposal from it."""
         with self.connect() as db, db.cursor() as cursor:
-            cursor.execute("SELECT COALESCE(MAX(version),0)+1 AS version FROM pipeline_proposals")
-            return int(cursor.fetchone()["version"])
-
-    def save_pipeline_proposal(self, proposal: PipelineProposal, assessment_id: str | None, actor: str) -> PipelineProposal:
-        with self.connect() as db, db.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_xact_lock(%s, hashtext(%s))", (PROPOSAL_VERSION_LOCK, assessment_id or ""))
+            stored = build(self._next_proposal_version(cursor, assessment_id))
             cursor.execute("""INSERT INTO pipeline_proposals(id,assessment_id,version,status,requirement,spec,created_by)
                               VALUES (%s,%s,%s,'draft',%s,%s::jsonb,%s)""",
-                           (proposal.proposal_id, assessment_id, proposal.version, proposal.requirement,
-                            proposal.model_dump_json(), actor))
-            self._audit(cursor, actor, "proposal.generated", "pipeline_proposal", proposal.proposal_id, "success")
-        return proposal
+                           (stored.proposal_id, assessment_id, stored.version, stored.requirement,
+                            stored.model_dump_json(), actor))
+            self._audit(cursor, actor, action, "pipeline_proposal", stored.proposal_id, "success")
+        return stored
+
+    @staticmethod
+    def _next_proposal_version(cursor, assessment_id: str | None) -> int:
+        cursor.execute(
+            "SELECT COALESCE(MAX(version),0)+1 AS version FROM pipeline_proposals WHERE assessment_id IS NOT DISTINCT FROM %s",
+            (assessment_id,),
+        )
+        return int(cursor.fetchone()["version"])
 
     def get_pipeline_proposal(self, proposal_id: str) -> PipelineProposal:
         with self.connect() as db, db.cursor() as cursor:
@@ -194,12 +249,17 @@ class SourceRepository:
             raise KeyError(proposal_id)
         return row["assessment_id"]
 
-    def save_proposal_revision(self, proposal: PipelineProposal, assessment_id: str | None, actor: str) -> PipelineProposal:
-        return self.save_pipeline_proposal(proposal, assessment_id, actor)
+    def save_proposal_revision(self, build: Callable[[int], PipelineProposal], assessment_id: str | None, actor: str) -> PipelineProposal:
+        return self.save_pipeline_proposal(build, assessment_id, actor, "proposal.revised")
 
     def decide_pipeline_proposal(self, proposal_id: str, decision: str, reason: str | None, actor: str) -> PipelineProposal:
         with self.connect() as db, db.cursor() as cursor:
-            cursor.execute("UPDATE pipeline_proposals SET status=%s WHERE id=%s", (decision, proposal_id))
+            cursor.execute(
+                """UPDATE pipeline_proposals
+                   SET status=%s, decision_reason=%s, decided_by=%s, decided_at=CURRENT_TIMESTAMP
+                   WHERE id=%s""",
+                (decision, reason, actor, proposal_id),
+            )
             if cursor.rowcount == 0:
                 raise KeyError(proposal_id)
             self._audit(cursor, actor, f"proposal.{decision}", "pipeline_proposal", proposal_id, "success")
