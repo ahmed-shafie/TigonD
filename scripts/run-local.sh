@@ -4,6 +4,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 
+if [ ! -f backend/compose.yaml ] || [ ! -f package.json ]; then
+  echo "Run this script from inside the TigonD project: cd <project> && bash scripts/run-local.sh" >&2
+  exit 1
+fi
+
 export TIGOND_METADATA_DATABASE_URL=postgresql://tigond_meta:tigond_meta@localhost:55432/tigond_metadata
 export TIGOND_VAULT_URL=http://localhost:8200
 export TIGOND_VAULT_TOKEN=tigond-dev-root
