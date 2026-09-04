@@ -48,3 +48,8 @@ backend/.venv/
 **/__pycache__/
 *.py[cod]
 .pytest_cache/
+
+# local dev script artifacts
+/.venv/
+.credential-key
+backend.log
