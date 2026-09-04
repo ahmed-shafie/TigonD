@@ -9,6 +9,17 @@ if [ ! -f backend/compose.yaml ] || [ ! -f package.json ]; then
   exit 1
 fi
 
+missing=""
+for tool in docker python3 node npm curl; do
+  command -v "$tool" >/dev/null 2>&1 || missing="${missing} ${tool}"
+done
+if [ -n "${missing}" ]; then
+  echo "Install first:${missing}" >&2
+  echo "  docker -> https://docs.docker.com/get-docker" >&2
+  echo "  node/npm -> https://nodejs.org (LTS) or: brew install node" >&2
+  exit 1
+fi
+
 export TIGOND_METADATA_DATABASE_URL=postgresql://tigond_meta:tigond_meta@localhost:55432/tigond_metadata
 export TIGOND_VAULT_URL=http://localhost:8200
 export TIGOND_VAULT_TOKEN=tigond-dev-root
